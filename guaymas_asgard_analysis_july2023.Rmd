@@ -1,0 +1,503 @@
+---
+title: "Guaymas Asgardarchaeota analysis"
+author: David Geller-McGrath
+date: July 3, 2023
+output:
+  html_document:
+    df_print: paged
+    toc: true # create a table of contents
+    toc_depth: 5 # up to five depths of headings in the toc
+    theme: united # select the document theme
+    syntax: tango # select syntax highlight theme
+---
+
+<br>
+
+This code was used for the analyses of Guaymas Basin metagenomes and metatranscriptomes for the 2023 publication "Metagenomic Profiles of Archaea and Bacteria within Thermal and Geochemical Gradients of the Guaymas Basin Deep Subsurface" by Geller-McGrath et al. Some sections of these analyses were done on a compute node of the Poseidon High Performance Computing (HPC) cluster based at the Woods Hole Oceanographic Institute (WHOI). All of the analyses done here using R can be run locally; HPC processing was used to speed up computations.
+
+<br>
+
+Load required R libraries
+
+```{r include=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ComplexHeatmap)
+library(ShortRead)
+library(furrr)
+```
+
+<br>
+
+## Download and parse KEGG modules
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# download model metadata from KEGG in readable list format in R
+currentAvailableKeggModules = KEGGREST::keggList('module') |>
+  as.data.frame() |>
+  rownames_to_column('module') |>
+  rename(module_name = 2)
+
+
+
+format_db_entry = function(keggModuleDl) {
+  DbEntry = tibble(
+    data_name = 'ENTRY',
+    data_value = keggModuleDl[[1]]$ENTRY,
+    data_definition = names(keggModuleDl[[1]]$ENTRY)
+  ) |>
+    bind_rows(
+      tibble(
+        data_name = 'NAME',
+        data_value = keggModuleDl[[1]]$NAME,
+        data_definition = NA_character_
+      )) |>
+    bind_rows(
+      tibble(
+        data_name = 'DEFINITION',
+        data_value = keggModuleDl[[1]]$DEFINITION,
+        data_definition = NA_character_
+      )) |>
+    bind_rows(
+      tibble(
+        data_name = 'ORTHOLOGY',
+        data_value = names(keggModuleDl[[1]]$ORTHOLOGY),
+        data_definition = keggModuleDl[[1]]$ORTHOLOGY) |>
+        separate_rows(data_value, sep = ',')
+    )
+
+  if ('CLASS' %in% names(keggModuleDl[[1]])) {
+    DbEntry = DbEntry |>
+      bind_rows(
+        tibble(
+          data_name = 'CLASS',
+          data_value = keggModuleDl[[1]]$CLASS,
+          data_definition = NA_character_
+        ))
+  }
+
+  if ('PATHWAY' %in% names(keggModuleDl[[1]])) {
+    DbEntry = DbEntry |>
+      bind_rows(
+        tibble(
+          data_name = 'PATHWAY',
+          data_value = names(keggModuleDl[[1]]$PATHWAY),
+          data_definition = keggModuleDl[[1]]$PATHWAY
+        )
+      )
+  }
+
+  if ('REACTION' %in% names(keggModuleDl[[1]])) {
+
+    if (!is.null(names(keggModuleDl[[1]]$REACTION))) {
+    DbEntry = DbEntry |>
+      bind_rows(
+        tibble(
+          data_name = 'REACTION',
+          data_value = names(keggModuleDl[[1]]$REACTION),
+          data_definition = keggModuleDl[[1]]$REACTION
+        ) |>
+          separate_rows(data_value, sep = ',')
+      )
+    } else {
+      reactionNames = keggModuleDl[[1]]$REACTION |>
+        str_replace('(^.*R\\d{5}) .*', '\\1')
+
+      keggModuleDl[[1]]$REACTION = keggModuleDl[[1]]$REACTION |>
+        str_replace('^.*R\\d{5} (.*)', '\\1') |>
+        set_names(reactionNames)
+
+      DbEntry = DbEntry |>
+        bind_rows(
+          tibble(
+            data_name = 'REACTION',
+            data_value = names(keggModuleDl[[1]]$REACTION),
+            data_definition = keggModuleDl[[1]]$REACTION
+          ) |>
+            separate_rows(data_value, sep = ',')
+        )
+    }
+  }
+
+  if ('COMPOUND' %in% names(keggModuleDl[[1]])) {
+    DbEntry = DbEntry |>
+      bind_rows(
+        tibble(
+          data_name = 'COMPOUND',
+          data_value = names(keggModuleDl[[1]]$COMPOUND),
+          data_definition = keggModuleDl[[1]]$COMPOUND
+        ) |>
+          separate_rows(data_value, sep = ',')
+      )
+  }
+
+  DbEntry = DbEntry |>
+    mutate(module = keggModuleDl[[1]]$ENTRY, .before = 1)
+}
+
+
+
+create_db_entry = function(DbEntry) {
+    KEGGREST::keggGet(DbEntry) |>
+          format_db_entry()
+}
+
+
+safely_create_db_entry = safely(create_db_entry)
+
+
+
+KeggModuleDbEntries = currentAvailableKeggModules$module |>
+  map(~ safely_create_db_entry(.x)) |>
+  set_names(currentAvailableKeggModules$module)
+
+# see distribution of modules that were properly formatted and those that failed
+table(map_lgl(KeggModuleDbEntries, ~ is.null(.x$error)))
+
+KeggModuleDbEntriesFinal = KeggModuleDbEntries |>
+  map_dfr(~ .x$result) %>%
+  mutate(line = 1:nrow(.))
+
+saveRDS(KeggModuleDbEntriesFinal, file = 'data/metadata/keggModuleDbEntriesFinal.rds')
+
+
+keggDbOrthology = KeggModuleDbEntriesFinal |> 
+  filter(data_name == 'ORTHOLOGY') |> 
+  select(-c(line, data_name)) |> 
+  rename(k_number = data_value,
+         annotation = data_definition)
+
+keggDbClass = KeggModuleDbEntriesFinal |> 
+  filter(data_name == 'CLASS') |>
+  select(-c(line, data_name, data_definition)) |> 
+  rename(module_category = data_value)
+  
+length(unique(keggDbClass$module)) #478
+
+keggModuleSummary = keggDbOrthology |> 
+  left_join(keggDbClass, by = 'module')
+```
+
+<br>
+
+## Calculate FastQ read counts in all metatranscriptome samples
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# get fastq read counts
+
+#set parallel processing parameters
+plan(multicore, workers = 35) #2700 * 1024 ^2 - 2.7Gb per core, 35 cores total
+options(future.globals.maxSize = 2831155200) #set maximum memory per parallal worker
+
+
+setwd('/vortexfs1/omics/edgcomb/home_vedgcomb/Beaudoin/IODP_385/transcriptomes/Fastx_output')
+fastqFiles = list.files()
+
+fastqCounts = countFastq('.')
+
+fastqCounts = fastqCounts |> 
+  rownames_to_column('fastq_file') |> 
+  as_tibble() |> 
+  select(fastq_file, records) |> 
+  dplyr::rename(n_reads = records)
+
+write_tsv(fastqCounts, file = '/vortexfs1/omics/edgcomb/home_vedgcomb/Beaudoin/IODP_385/transcriptomes/fastq_read_counts/metaT_fastqCounts.tsv')
+
+
+# checking record counts in each fastq w/ alternative bash method
+# using bash command: zcat my.fastq.gz | echo $((`wc -l`/4))
+fastqNames = fastqFiles |> 
+  str_replace('^(.*)(_.*_R\\d).*', 'U\\1B\\2')
+
+fastqCountsBash = fastqFiles |> 
+  future_map(
+    ~ system(paste0('zcat ', .x, ' | echo $((`wc -l`/4))'), 
+             intern = TRUE)
+  )
+
+fastqCountsBashTbl = tibble(
+  fastq_file = fastqFiles |> str_replace('.gz', ''),
+  n_reads = map_chr(fastqCountsBash, ~ .x) |> as.integer())
+
+
+# compare results
+
+fastqR = read_tsv('/vortexfs1/omics/edgcomb/home_vedgcomb/Beaudoin/IODP_385/transcriptomes/fastq_read_counts/metaT_fastqCounts.tsv')
+
+
+
+fastqCountsBashTbl
+fastqR
+
+#TRUE - both methods yielded same number of records
+all(fastqCountsBashTbl$n_reads == fastqR$n_reads)
+```
+
+<br>
+
+## Create heatmap
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+dramFiles = system('ls ~/Documents/guaymas/data/dram/annotations/*.tsv', intern = TRUE)
+
+
+
+magKeggAnnotations = dramFiles |> 
+  map_dfr(~ read_tsv(.x, show_col_types = FALSE) |> 
+        rename(dram_gene_name = 1,
+               mag_name = fasta,
+               k_number = ko_id) |> 
+        select(mag_name, k_number, dram_gene_name, scaffold) |> 
+        filter(!is.na(k_number)))
+  
+table(magKeggAnnotations$mag_name)
+
+
+dramKeggData = magKeggAnnotations |> 
+  left_join(keggModuleSummary, 
+            by = 'k_number', 
+            relationship = 'many-to-many') |> 
+  filter(!is.na(module)) |> 
+  mutate(dram_gene_number = dram_gene_name |> 
+           str_replace('.*(_\\d+)$', '\\1'),
+         .after = dram_gene_name) |> 
+  mutate(gene_name = paste0(scaffold, dram_gene_number), .after = k_number) |> 
+  select(-c(dram_gene_name, dram_gene_number, scaffold))
+
+dramKeggData = dramKeggData |> 
+  mutate(module_category = module_category |> str_replace_all(c('; ' = ';'))) |> 
+  separate(module_category,
+           into = c('module_type', 'module_class', 'module_group'),
+           sep = ';')
+
+
+# read in coverM mapping results
+fastqReadCounts = read_tsv('~/Documents/guaymas/data/metadata/metaT_fastqCounts.tsv')
+
+metaT_sampleReadCounts = fastqReadCounts |> 
+  mutate(sample = fastq_file |> 
+           str_replace('(.*)_(.*)_R.*', 'U\\1B_\\2'),
+         .before = 1) |> 
+  select(-fastq_file) |> 
+  group_by(sample) |> 
+  summarize(n_reads = sum(n_reads))
+  
+
+covermFiles = system('ls ~/Documents/guaymas/data/coverM/reads_mapped_per_gene/*.tsv', intern = TRUE)
+
+covermTbl = tibble(
+  file = covermFiles) |> 
+  mutate(sample = covermFiles |> str_replace('\\/.*\\/+(.*)_(.*)_metaT.*', 'U\\1B_\\2'),
+         .before = 1) |> 
+  left_join(metaT_sampleReadCounts, by = 'sample')
+
+
+covermData = map2(covermTbl$file, covermTbl$n_reads, function(.file, .n_reads) 
+                    read_tsv(.file) |> 
+                    rename(gene_name = 1) |> 
+                    select(1, 4) |> 
+                    rename_with(~ str_replace(.x, '.*\\/(.*)_R1.*', 'U\\1'),
+                                .cols = 2) |> 
+                    mutate(across(.cols = 2, ~ (.x / .n_reads) * 100))
+                  ) |> 
+  reduce(left_join, by = 'gene_name')
+
+covermSummary = covermData |> 
+  summarize(across(2:last_col(), ~ sum(.x))) |> 
+  pivot_longer(
+    cols = everything(),
+    names_to = 'sample',
+    values_to = 'total_percent_reads'
+  )
+
+covermSummary |> pull(total_percent_reads)
+
+### join dram annotations with mapping results
+
+
+heatmapDataRaw = dramKeggData |> 
+  left_join(covermData, by = 'gene_name') |> 
+  rename_with(.cols = starts_with('U'), ~ str_replace(.x, '(.*)_(.*)', '\\1B_\\2'))
+
+
+
+heatmapDataConcat = heatmapDataRaw |> 
+  group_by(module_group) |> 
+  summarize(across(where(is.double), ~ sum(.x)))
+
+
+genome_metaT_colAnno_onlyMetagenomeSites = readRDS('~/Documents/guaymas_analysis/rdata_files/genome_metaT_colAnno_onlyMetagenomeSites.rds')
+heat_figure2_metaT = readRDS('~/Documents/guaymas_analysis/rdata_files/heat_figure2_metaT.rds')
+guayMagRelPalette = readRDS('~/Documents/guaymas_analysis/rdata_files/guayMagRelPalette.rds')
+
+
+genome_metaT_colAnno_onlyMetagenomeSites = 
+  genome_metaT_colAnno_onlyMetagenomeSites |> 
+  rownames_to_column('sample') |> 
+  rename(depth = `Depth (mbsf)`) |> 
+  mutate(new_sample_name = sample |> 
+           str_replace('(.*)_.*', paste0('\\1_', depth)))
+
+genome_metaT_colAnno_onlyMetagenomeSites |> 
+  arrange(Temperature)
+
+
+asgard_heatmap = heatmapDataConcat |>
+  column_to_rownames('module_group') |>
+  select(genome_metaT_colAnno_onlyMetagenomeSites |>
+             arrange(Temperature) |>
+             pull(sample)) |>
+  rename_with(~ genome_metaT_colAnno_onlyMetagenomeSites |>
+                arrange(Temperature) |>
+                pull(new_sample_name)) |>
+  as.matrix() |> 
+  
+  ComplexHeatmap::pheatmap(
+    name = 'Total reads mapped (%)',
+    main = 'Asgardarchaeota metatranscriptomic read recruitment',
+     gaps_col = c(8,12),
+    show_colnames = TRUE,
+    show_rownames = TRUE,
+    annotation_col = genome_metaT_colAnno_onlyMetagenomeSites |>
+      column_to_rownames('sample') |> 
+      select(depth, Temperature) |> 
+      arrange(Temperature) |>
+      rename(`Temperature (°C)` = Temperature,
+             `Depth (mbsf)` = depth),
+    annotation_colors = guayMagRelPalette,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    border_color = 'grey30',
+    treeheight_row = 0,
+    treeheight_col = 10,
+    color = c('grey60', rev(viridis::magma(n = 50))),
+    show_row_dend = FALSE,
+    show_column_dend = TRUE
+  )
+
+ComplexHeatmap::draw(asgard_heatmap, 
+                     merge_legend = TRUE,
+                     heatmap_legend_side = "left", 
+                     annotation_legend_side = "left"
+                     )
+
+
+# pdf(
+#   file = '~/Documents/guaymas/plots/asgard_heatmap.pdf',
+#   width = 10,
+#   height = 7)
+# ComplexHeatmap::draw(asgard_heatmap, 
+#                      merge_legend = TRUE,
+#                      heatmap_legend_side = "left", 
+#                      annotation_legend_side = "left"
+# )
+# dev.off()
+
+```
+
+
+
+## Map metatranscriptomic reads to MAGs using CoverM
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=compute # Queue selection
+#SBATCH --job-name=coverM_r # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_27_2023_coverm_metaT_mapping_did_guaymas_MAG_genes_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-45
+#SBATCH --qos=unlim
+
+source activate coverm
+
+## create bwa index
+# conda activate coverm
+# cd /vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/coverM/genes_reference
+# cat ../../genes/fna/* >> all_didi_mag_genes.fna
+# bwa index all_didi_mag_genes.fna
+
+
+MAG_GENES_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/coverM/genes_reference")
+
+
+IN_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/Beaudoin/IODP_385/transcriptomes/Fastx_output")
+
+
+OUT_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/coverM/metaT/reads_mapped_per_gene")
+
+
+OUT_BAM_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/coverM/metaT/reads_mapped_per_gene/bam_files")
+
+
+FILE_PATTERN=("1545_11H3" "1545_1H2" "1545_4H3" "1546_12H2" "1546_1H2" "1546_3H2" "1547_1H2" "1547_5H2" "1547_9H2" "1548_1H2" "1548_4H7" "1549_1H2" "1549_3H2" "1550_1H2" "1550_3H2" "1551_1H2" "1551_3H2" "1552_1H2" "1552_3H4")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+coverm contig \
+--coupled "$IN_DIR"/"$FILE_PATTERN"_R1_paired_fastx.fastq "$IN_DIR"/"$FILE_PATTERN"_R2_paired_fastx.fastq \
+--reference "$MAG_GENES_DIR"/all_didi_mag_genes.fna \
+--mapper bwa-mem \
+--methods tpm rpkm count mean \
+--min-read-percent-identity 95 \
+--min-read-aligned-percent 50 \
+--exclude-supplementary \
+--threads 5 \
+--output-file "$OUT_DIR"/"$FILE_PATTERN"_metaT_bwa2_reads_mapped_per_gene.tsv \
+--bam-file-cache-directory "$OUT_BAM_DIR" \
+--discard-unmapped
+```
+
+
+
+
+## Annotate MAGs using DRAM
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=dram # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=36 # Run on one CPU
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=187gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_23_2023_DRAM_annotation_of_did_guaymas_mags_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-5
+#SBATCH --qos=scavenger
+
+# directory containing the Guaymas MAGs
+MAG_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/mags")
+
+# directory for all dram annotation output
+OUT_DIR=$(echo "/vortexfs1/omics/edgcomb/home_vedgcomb/dgellermcgrath/didi/dram/annotations")
+
+
+# load dram conda environment
+module load anaconda/5.1
+source activate dram
+
+# bash array of mag name identifiers
+FILE_PATTERN=("U1545B_2H_3_S2_concoct_44_sub" "U1546D_4H_concoct_72_sub_1" "U1546D_4H_metabat_22_1" "U1547B_2H_3_S9_metabat_24_1" "U1547B_3H_concoct_68" "U1547B_4H_metabat_124_sub_1")
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+DRAM.py annotate \
+-i "$MAG_DIR"/"$FILE_PATTERN".fa \
+-o "$OUT_DIR"/"$FILE_PATTERN" \
+--threads 35 \
+--min_contig_size 2000
+```
+
+
+
+
+
+
